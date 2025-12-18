@@ -1,15 +1,103 @@
-name: Build & Release (macOS + Windows)
+name: Release (tag + build + publish)
 
 on:
   push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'
+    branches: ["main"]
 
 permissions:
   contents: write
 
 jobs:
-  build:
+  tag:
+    runs-on: ubuntu-latest
+    outputs:
+      newtag: ${{ steps.tag.outputs.newtag }}
+      changelog: ${{ steps.tag.outputs.changelog }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute next tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git fetch --tags
+          TAG=$(git tag | sort -uV | tail -n 1)
+          [[ -z "${TAG:-}" ]] && TAG="v0.0.0"
+          echo "Latest tag: $TAG"
+
+          if [[ "$TAG" == "v0.0.0" ]]; then
+            LOG=$(git log --pretty=format:%s)
+          else
+            LOG=$(git log "$TAG..HEAD" --pretty=format:%s)
+          fi
+
+          BREAK=$(echo "$LOG" | grep -e '!' || true)
+          FEAT=$(echo "$LOG" | grep -e '^feat' || true)
+          FIX=$(echo "$LOG" | grep -e '^fix' || true)
+
+          VERSION=${TAG#v}
+          IFS='.' read -r major minor patch <<< "$VERSION"
+
+          if [[ -n "$BREAK" ]]; then
+            major=$((major+1)); minor=0; patch=0
+          elif [[ -n "$FEAT" ]]; then
+            minor=$((minor+1)); patch=0
+          elif [[ -n "$FIX" ]]; then
+            patch=$((patch+1))
+          else
+            echo "No relevant changes; skipping release."
+            echo "newtag=" >> "$GITHUB_OUTPUT"
+            echo "changelog=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          NEWTAG="v$major.$minor.$patch"
+          echo "newtag=$NEWTAG" >> "$GITHUB_OUTPUT"
+
+          # Put changelog in a file-safe, multi-line output
+          {
+            echo "changelog<<'EOF'"
+            echo "$LOG"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create and push git tag
+        if: steps.tag.outputs.newtag != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          NEWTAG="${{ steps.tag.outputs.newtag }}"
+
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+
+          git tag "$NEWTAG"
+          git push origin "$NEWTAG"
+
+  create_release:
+    needs: tag
+    if: needs.tag.outputs.newtag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create GitHub release (empty for now)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.tag.outputs.newtag }}"
+          NOTES="${{ needs.tag.outputs.changelog }}"
+
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "Release $TAG" --notes "$NOTES"
+
+  build_and_upload:
+    needs: [tag, create_release]
+    if: needs.tag.outputs.newtag != ''
     strategy:
       fail-fast: false
       matrix:
@@ -18,9 +106,7 @@ jobs:
             goos: darwin
           - os: windows-latest
             goos: windows
-
     runs-on: ${{ matrix.os }}
-
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,15 +125,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          APPNAME="activifier"
           fyne package -os darwin -icon assets/Icon.png -name "Activifier"
-          rm -rf source_folder Activifier.dmg
+
+          rm -rf source_folder Activifier-macos.dmg
           mkdir source_folder
           cp -r "Activifier.app" source_folder/
           ln -s /Applications source_folder/Applications
-          hdiutil create -volname "Activifier Installer" -srcfolder "./source_folder" -ov -format UDZO "Activifier-macos.dmg"
+          hdiutil create -volname "Activifier Installer" \
+            -srcfolder "./source_folder" -ov -format UDZO "Activifier-macos.dmg"
           rm -rf source_folder
-          echo "ASSET=Activifier-macos.dmg" >> $GITHUB_ENV
 
       - name: Package (Windows)
         if: matrix.goos == 'windows'
@@ -55,22 +141,23 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           fyne package -os windows -icon assets/Icon.png -name "Activifier"
-          # Fyne typically outputs Activifier.exe
+
           $exe = "Activifier.exe"
           if (!(Test-Path $exe)) { throw "Expected $exe not found" }
+
           $zip = "Activifier-windows.zip"
           Compress-Archive -Path $exe -DestinationPath $zip -Force
-          "ASSET=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Create release (once) + upload asset
-        shell: bash
+      - name: Upload asset to GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${{ needs.tag.outputs.newtag }}"
 
-          # Create release if it doesn't exist (idempotent)
-          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Release $TAG" --notes ""
-
-          gh release upload "$TAG" "$ASSET" --clobber
+          if [[ "${{ matrix.goos }}" == "darwin" ]]; then
+            gh release upload "$TAG" "Activifier-macos.dmg" --clobber
+          else
+            gh release upload "$TAG" "Activifier-windows.zip" --clobber
+          fi
