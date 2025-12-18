@@ -59,11 +59,10 @@ jobs:
           echo "newtag=$NEWTAG" >> "$GITHUB_OUTPUT"
 
           # Put changelog in a file-safe, multi-line output
-          {
-            echo "changelog<<'EOF'"
-            echo "$LOG"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          DELIM="CHANGELOG_$(date +%s)_$RANDOM"
+          echo "changelog<<$DELIM" >> "$GITHUB_OUTPUT"
+          printf "%s\n" "$LOG" >> "$GITHUB_OUTPUT"
+          echo "$DELIM" >> "$GITHUB_OUTPUT"
 
       - name: Create and push git tag
         if: steps.tag.outputs.newtag != ''
