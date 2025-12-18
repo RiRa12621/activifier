@@ -1,0 +1,76 @@
+name: Build & Release (macOS + Windows)
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            goos: darwin
+          - os: windows-latest
+            goos: windows
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      - name: Install Fyne tool
+        run: go install fyne.io/tools/cmd/fyne@latest
+
+      - name: Package (macOS)
+        if: matrix.goos == 'darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          APPNAME="activifier"
+          fyne package -os darwin -icon assets/Icon.png -name "Activifier"
+          rm -rf source_folder Activifier.dmg
+          mkdir source_folder
+          cp -r "Activifier.app" source_folder/
+          ln -s /Applications source_folder/Applications
+          hdiutil create -volname "Activifier Installer" -srcfolder "./source_folder" -ov -format UDZO "Activifier-macos.dmg"
+          rm -rf source_folder
+          echo "ASSET=Activifier-macos.dmg" >> $GITHUB_ENV
+
+      - name: Package (Windows)
+        if: matrix.goos == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          fyne package -os windows -icon assets/Icon.png -name "Activifier"
+          # Fyne typically outputs Activifier.exe
+          $exe = "Activifier.exe"
+          if (!(Test-Path $exe)) { throw "Expected $exe not found" }
+          $zip = "Activifier-windows.zip"
+          Compress-Archive -Path $exe -DestinationPath $zip -Force
+          "ASSET=$zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Create release (once) + upload asset
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+
+          # Create release if it doesn't exist (idempotent)
+          gh release view "$TAG" >/dev/null 2>&1 || gh release create "$TAG" --title "Release $TAG" --notes ""
+
+          gh release upload "$TAG" "$ASSET" --clobber
